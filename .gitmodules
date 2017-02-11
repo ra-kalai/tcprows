@@ -1,0 +1,9 @@
+[submodule "extra/lem"]
+	path = extra/lem
+	url = https://github.com/ra-kalai/lem
+[submodule "extra/lem-mbedtls"]
+	path = extra/lem-mbedtls
+	url = https://github.com/ra-kalai/lem-mbedtls
+[submodule "extra/lem-websocket"]
+	path = extra/lem-websocket
+	url = https://github.com/ra-kalai/lem-websocket
