@@ -17,10 +17,11 @@ This program support http_proxy / https_proxy environment variables.
 Available options are:
 ]],
   possible = {
-    {'h', 'help',             {desc="display this",  type='counter'}},
-    {'s', 'server',           {desc="server mode",   type='counter'}},
-    {'c', 'client',           {desc="client mode",   type='counter'}},
-    {'i', 'info-debug-level', {desc="set info/debug lvl, 1 10",   default_value=1}},
+    {'h', 'help',              {desc="display this",  type='counter'}},
+    {'s', 'server',            {desc="server mode",   type='counter'}},
+    {'c', 'client',            {desc="client mode",   type='counter'}},
+    {'i', 'info-debug-level',  {desc="set info/debug lvl, 1 10",   default_value=1}},
+    {'w', 'websocket-keep-alive',        {desc="send websocket ping every X sec, when no data get transmitted", default_value=30}},
   },
 }
 
@@ -53,6 +54,7 @@ if g_url == nil then
 end
 
 local g_debug_lvl = tonumber(parg:get_last_val('info-debug-level'))
+local g_websocket_keep_alive = tonumber(parg:get_last_val('websocket-keep-alive'))
 local g_debug_normal = 1
 local g_debug_verbose = 10
 
@@ -79,6 +81,7 @@ local mbedtls = require 'lem.mbedtls'
 
 local spawn = utils.spawn
 local utils_now = utils.now
+local sleep = utils.sleep
 local format = string.format
 
 function dbg_p(lvl, raw_or_format, ...)
@@ -98,6 +101,34 @@ function dbg_p(lvl, raw_or_format, ...)
 end
 
 function tunnel_ws_sock(res, sock) -- %{
+  local last_ws_read = utils_now()
+  local closed = false
+
+  function close_all()
+    if closed == false then
+      sock:close()
+      res:close()
+      closed = true
+    end
+  end
+
+  spawn(function ()
+    local ok, err
+    while true do
+      if last_ws_read + g_websocket_keep_alive < utils_now() then
+        ok, err = res:ping()
+        if ok == nil then
+          dbg_p(g_debug_verbose, "ws timeout.. ")
+          break
+        end
+
+        last_ws_read = utils_now()
+      end
+      sleep(1)
+    end
+    close_all()
+  end)
+
   spawn(function ()
     local buf, err 
     while true do
@@ -108,19 +139,19 @@ function tunnel_ws_sock(res, sock) -- %{
       end
       res:sendBinary(buf)
     end
-    sock:close()
-    res:close()
+    close_all()
   end)
+
   while true do
     err, payload = res:getFrame()
+    last_ws_read = utils_now()
     if err then
       dbg_p(g_debug_verbose, "websocket error: %d %s", err, payload)
       break
     end
     sock:write(payload)
   end
-  sock:close()
-  res:close()
+  close_all()
 end -- }%
 
 function client_mode() -- %{
