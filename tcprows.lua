@@ -142,6 +142,7 @@ function tunnel_ws_sock(res, sock) -- %{
     close_all()
   end)
 
+  local err, payload
   while true do
     err, payload = res:getFrame()
     last_ws_read = utils_now()
