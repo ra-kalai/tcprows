@@ -69,11 +69,10 @@ if g_hostname == nil or g_port == nil then
   io.stderr:write("bind|connect argument need to be of this format: localhost:2222 or 1.2.3.4:22\n")
   os.exit(1)
 end
-  
+
 -- do we need a proxy to connect outside ?
 local g_http_proxy = os.getenv('http_proxy')
 local g_https_proxy = os.getenv('https_proxy')
-
 
 local utils  = require 'lem.utils'
 local websocket = require 'lem.websocket.handler'
@@ -104,123 +103,125 @@ function tunnel_ws_sock(res, sock) -- %{
   local last_ws_read = utils_now()
   local closed = false
 
-  function close_all()
+  local close_all = function()
     if closed == false then
-      sock:close()
-      res:close()
-      closed = true
+        sock:close()
+        res:close()
+        closed = true
+      end
     end
-  end
 
-  spawn(function ()
-    local ok, err
-    while true do
-      if last_ws_read + g_websocket_keep_alive < utils_now() then
-        ok, err = res:ping()
-        if ok == nil then
-          dbg_p(g_debug_verbose, "ws timeout.. ")
+    spawn(function ()
+      local ok, err
+      while closed == false do
+        if last_ws_read + g_websocket_keep_alive < utils_now() then
+          ok, err = res:ping()
+          if ok == nil then
+            dbg_p(g_debug_verbose, "ws timeout.. ")
+            break
+          end
+
+          last_ws_read = utils_now()
+        end
+        sleep(1)
+      end
+      close_all()
+    end)
+
+    spawn(function ()
+      local buf, err
+      while closed == false do
+        buf, err = sock:read()
+        if buf == nil then
+          dbg_p(g_debug_verbose, "socket error: %s", err)
           break
         end
-
-        last_ws_read = utils_now()
+        res:sendBinary(buf)
       end
-      sleep(1)
-    end
-    close_all()
-  end)
+      close_all()
+    end)
 
-  spawn(function ()
-    local buf, err 
-    while true do
-      buf, err = sock:read()
-      if buf == nil then
-        dbg_p(g_debug_verbose, "socket error: %s", err)
+    local err, payload
+    while closed == false do
+      err, payload = res:getFrame()
+      last_ws_read = utils_now()
+      if err then
+        dbg_p(g_debug_verbose, "websocket error: %d %s", err, payload)
         break
       end
-      res:sendBinary(buf)
+      sock:write(payload)
     end
     close_all()
-  end)
+  end -- }%
 
-  local err, payload
-  while true do
-    err, payload = res:getFrame()
-    last_ws_read = utils_now()
-    if err then
-      dbg_p(g_debug_verbose, "websocket error: %d %s", err, payload)
-      break
-    end
-    sock:write(payload)
-  end
-  close_all()
-end -- }%
+  local main = {
+    client = function () -- %{
+      local sock = io.tcp.listen(g_hostname, g_port)
 
-function client_mode() -- %{
-  local sock = io.tcp.listen(g_hostname, g_port)
+      local ssl_conf = {
+        mode='client',
+        ssl_verify_mode=0,
+      }
 
-  local ssl_conf = {
-    mode='client',
-    ssl_verify_mode=0,
-  }
+    local g_sslconfig, err = mbedtls.new_tls_config(ssl_conf)
 
-  local g_sslconfig, err = mbedtls.new_tls_config(ssl_conf)
+    print('waiting for connection on '.. g_bind_connect .. " to tunnel to " .. g_url)
+    print('http proxy?', g_http_proxy, 'https proxy?', g_https_proxy)
 
-  print('waiting for connection on '.. g_bind_connect .. " to tunnel to " .. g_url)
-  print('http proxy?', g_http_proxy, 'https proxy?', g_https_proxy)
+    print("create a remote tunnel to the gateway")
+    print("ssh -N -p " .. g_port .. " ar@localhost -R '*:2222:127.0.0.1:22'")
 
-  print("create a remote tunnel to the gateway")
-  print("ssh -N -p " .. g_port .. " ar@localhost -R '*:2222:127.0.0.1:22'")
+    sock:autospawn(function (client)
+      local res, err = websocket.client({
+        url=g_url,
+        req={http_proxy=g_http_proxy, https_proxy=g_https_proxy},
+        ssl=g_sslconfig
+      })
 
-  sock:autospawn(function (client)
-    local res, err = websocket.client({
-      url=g_url,
-      req={http_proxy=g_http_proxy, https_proxy=g_https_proxy},
-      ssl=g_sslconfig
-    })
+      if err then
+        dbg_p(g_debug_normal, "can't open websocket: " .. g_url )
+        dbg_p(g_debug_normal, table.concat(err,'\t'))
+        client:close()
+        return
+      end
 
-    if err then
-      dbg_p(g_debug_normal, "can't open websocket: " .. g_url )
-      dbg_p(g_debug_normal, table.concat(err,'\t'))
-      client:close()
-      return 
-    end
+      tunnel_ws_sock(res, client)
+    end)
+  end -- }%
+,
+  server = function () -- %{
+    local hathaway = require 'lem.hathaway'
 
-    tunnel_ws_sock(res, client)
-end)
+    hathaway.debug = function (...) dbg_p(g_debug_normal, table.concat({...}, "\t")) end
+    hathaway.import()
 
-end -- }%
+    local proto, domain_and_port, path = g_url:match('([a-zA-Z0-9]+)://([^/]+)(/.*)')
+    local listen_domain, listen_port = domain_and_port:match("^([^:]*):([0-9]*)$")
 
-function server_mode() -- %{
-  local hathaway = require 'lem.hathaway'
+    GET(path, function (req, res)
+      local err, err_msg = websocket.serverHandler(req, res)
 
-  hathaway.debug = function (...) dbg_p(g_debug_normal, table.concat({...}, "\t")) end
-  hathaway.import()
+      if err ~= nil then
+        res.status = 400
+        res.headers['Content-Type'] = 'text/plain'
+        res:add('Websocket Failure!\n' .. err .. "\n")
+        return
+      end
 
-  local proto, domain_and_port, path = g_url:match('([a-zA-Z0-9]+)://([^/]+)(/.*)')
-  local listen_domain, listen_port = domain_and_port:match("^([^:]*):([0-9]*)$")
+      local payload
+      local client, err = io.tcp.connect(g_hostname, g_port)
+      if client == nil then
+        dbg_p(g_debug_normal,"could not connect to %s %s", g_bind_connect, err)
+        res:close()
+        return
+      end
+      tunnel_ws_sock(res, client)
+    end)
 
-  GET(path, function (req, res)
-    local err, err_msg = websocket.serverHandler(req, res)
+    print('waiting for connection on ' .. domain_and_port)
+    Hathaway(listen_domain, listen_port)
+  end -- }%
+}
 
-    if err ~= nil then
-      res.status = 400
-      res.headers['Content-Type'] = 'text/plain'
-      res:add('Websocket Failure!\n' .. err .. "\n")
-      return 
-    end
 
-    local payload
-    local client, err = io.tcp.connect(g_hostname, g_port)
-    if client == nil then
-      dbg_p(g_debug_normal,"could not connect to %s %s", g_bind_connect, err)
-      res:close()
-      return 
-    end
-    tunnel_ws_sock(res, client)
-  end)
-
-  print('waiting for connection on ' .. domain_and_port)
-  Hathaway(listen_domain, listen_port)
-end -- }%
-
-_G[g_mode .. '_mode']()
+main[g_mode]()
